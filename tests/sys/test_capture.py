@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Call capture (--capture, src/proc/capture.c) on a guest program whose
 function f(&buf, n) reads buf[0], writes buf[0] + n to buf[1], writes three
-bytes to stdout and returns buf[1]; main calls it with n = 5, then 7. Each
+bytes to stdout, getcwd()s into a buffer and returns buf[1]; main calls it with n = 5, then 7. Each
 JSON record must hold exactly that: r0/r1 at entry, buf[0] as the only
 data input (besides the stack and literal pools in its text), buf[1] as an output, the write syscall with its result 3,
+getcwd with its result and the bytes it stored ("/w\\0") listed under it,
 and the return value. Skips (77) without an ARM cross assembler."""
 import json, os, shutil, subprocess, sys, tempfile
 
@@ -49,8 +50,11 @@ for rec, n in zip(recs, (5, 7)):
     check([list(w) for w in writes] == [[buf + 4, v.to_bytes(4, 'little').hex()]], f'call n={n}: outputs {writes}')
     stack = [w for w in rec['writes'] if sp - 16 <= w[0] < sp]
     check(stack and stack[0][0] == sp - 16, f'call n={n}: the push of 4 registers below sp is a write ({stack})')
-    check(len(rec['svcs']) == 1 and rec['svcs'][0][1] == 4 and rec['svcs'][0][2] == 1 and rec['svcs'][0][3] == 3,
-          f'call n={n}: one write syscall returning 3 ({rec["svcs"]})')
+    svcs = rec['svcs']
+    check(len(svcs) == 2 and svcs[0][1:4] == [4, 1, 3] and svcs[0][4] == [],
+          f'call n={n}: write returning 3, no output ({svcs[:1]})')
+    check(len(svcs) == 2 and svcs[1][1:4] == [183, syms['cwd'], 3] and svcs[1][4] == [[syms['cwd'], '2f7700']],
+          f'call n={n}: getcwd returning 3 with its output "/w\\0" ({svcs[1:]})')
     check(rec['ret'][0] == v, f'call n={n}: returns {rec["ret"][0]:#x}, expected {v:#x}')
 shutil.rmtree(work, ignore_errors=True)
 if failures:

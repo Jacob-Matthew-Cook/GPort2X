@@ -662,10 +662,21 @@ int gmem_read(gmem_t *m, gaddr_t addr, void *dst, uint32_t len)
     return GP_OK;
 }
 
+static gmem_write_observer_fn write_observer;
+static void *write_observer_ctx;
+
+void gmem_set_write_observer(gmem_write_observer_fn fn, void *ctx)
+{
+    write_observer = fn;
+    write_observer_ctx = ctx;
+}
+
 int gmem_write(gmem_t *m, gaddr_t addr, const void *src, uint32_t len)
 {
     if (!m || (len && !src) || (uint64_t)addr + len > 0x100000000ull)
         return GP_ERR_INVAL;
+    const gaddr_t addr0 = addr;
+    const uint32_t len0 = len;
     const uint8_t *in = src;
     while (len) {
         page_t *p = access_page(m, addr, GMEM_PROT_W);
@@ -684,6 +695,8 @@ int gmem_write(gmem_t *m, gaddr_t addr, const void *src, uint32_t len)
         in += n;
         len -= n;
     }
+    if (write_observer)
+        write_observer(write_observer_ctx, m, addr0, src, len0);
     return GP_OK;
 }
 

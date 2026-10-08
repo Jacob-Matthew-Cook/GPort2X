@@ -1,8 +1,9 @@
 @ Call capture (--capture): main calls f(&buf, 5) twice; f reads buf[0],
-@ stores buf[0] + n to buf[1], writes "ok\n" to stdout and returns buf[1].
-@ tests/sys/test_capture.py checks each record: the entry registers, the
-@ first-read bytes (buf[0]), the written bytes (buf[1]), the syscall with
-@ its result (3) and the return value.
+@ stores buf[0] + n to buf[1], writes "ok\n" to stdout, getcwd()s into cwd
+@ and returns buf[1]. tests/sys/test_capture.py checks each record: the entry
+@ registers, the first-read bytes (buf[0]), the written bytes (buf[1]), the
+@ syscalls with their results (3; 3) and getcwd's output ("/w\0") under it,
+@ and the return value.
     .text
     .global _start
 _start:
@@ -28,6 +29,10 @@ f:
     mov r2, #3
     mov r7, #4            @ write
     svc #0
+    ldr r0, =cwd
+    mov r1, #64
+    mov r7, #183          @ getcwd: the kernel writes "/w\0" into cwd
+    svc #0
     mov r0, r4
     pop {r4, r5, r7, pc}
 
@@ -36,3 +41,6 @@ buf:
     .word 0x11223344, 0
 msg:
     .ascii "ok\n"
+    .align 2
+cwd:
+    .space 64

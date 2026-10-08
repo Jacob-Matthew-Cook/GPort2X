@@ -16,8 +16,12 @@
  *
  *   {"addr":A,"seq":K,"pid":P,"flip":F,"insns":N,"complete":true,
  *    "regs":[r0..r15],"cpsr":C,"ret":[r0,r1],
- *    "svcs":[[imm,r7,r0_in,r0_out],...],
+ *    "svcs":[[imm,r7,r0_in,r0_out,[[addr,"hexbytes"],...]],...],
  *    "reads":[[addr,"hexbytes"],...],"writes":[[addr,"hexbytes"],...]}
+ *
+ * A syscall's own stores into guest memory (a read()'s data, a stat buffer)
+ * are listed with it: they are not the call's writes, they are inputs that
+ * arrive at that point (a chunked read refills one buffer).
  *
  * Accesses are watched in the interpreter only, so a run with captures
  * turns the JIT off. Instruction fetches are not inputs (code comes from
@@ -52,6 +56,7 @@ typedef struct crec {
     cpage_t **pages;          /* open addressing on page number */
     size_t npages, cap_pages;
     uint32_t (*svcs)[4];
+    struct svcout { uint8_t *buf; size_t len, cap; } *out; /* per syscall: [addr u32][n u32][n bytes]... */
     size_t nsvcs, cap_svcs;
 } crec_t;
 
@@ -164,7 +169,10 @@ static void rec_free(crec_t *r)
     for (size_t i = 0; i < r->cap_pages; i++)
         free(r->pages[i]);
     free(r->pages);
+    for (size_t i = 0; i < r->nsvcs; i++)
+        free(r->out[i].buf);
     free(r->svcs);
+    free(r->out);
     free(r);
 }
 
@@ -204,9 +212,22 @@ static void finish(gsys_t *s, gtask_t *t, crec_t *r, bool complete)
         fprintf(o, "%s%" PRIu32, i ? "," : "", r->regs[i]);
     fprintf(o, "],\"cpsr\":%" PRIu32 ",\"ret\":[%" PRIu32 ",%" PRIu32 "],\"svcs\":[", r->cpsr,
             complete ? now->r[0] : 0, complete ? now->r[1] : 0);
-    for (size_t i = 0; i < r->nsvcs; i++)
-        fprintf(o, "%s[%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]", i ? "," : "", r->svcs[i][0],
+    for (size_t i = 0; i < r->nsvcs; i++) {
+        fprintf(o, "%s[%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",[", i ? "," : "", r->svcs[i][0],
                 r->svcs[i][1], r->svcs[i][2], r->svcs[i][3]);
+        const struct svcout *so = &r->out[i];
+        for (size_t k = 0; k + 8 <= so->len;) {
+            uint32_t a, len;
+            memcpy(&a, so->buf + k, 4);
+            memcpy(&len, so->buf + k + 4, 4);
+            fprintf(o, "%s[%" PRIu32 ",\"", k ? "," : "", a);
+            for (uint32_t j = 0; j < len; j++)
+                fprintf(o, "%02x", so->buf[k + 8 + j]);
+            fputs("\"]", o);
+            k += 8 + len;
+        }
+        fputs("]]", o);
+    }
     fputs("],\"reads\":", o);
     if (pages)
         write_runs(o, pages, n, F_READ, false);
@@ -349,10 +370,39 @@ bool capture_breakpoint(gsys_t *s, gtask_t *t, gaddr_t pc)
 
 static void record_svc(crec_t *r, gtask_t *t, uint32_t imm, bool after);
 
+/* The syscall layer's stores into the capturing task's memory, during one
+ * of its syscalls: appended to that syscall in every open record. */
+static void on_kernel_write(void *ctx, gmem_t *m, gaddr_t addr, const void *src, uint32_t len)
+{
+    gtask_t *t = ctx;
+    if (!t->mm || m != t->mm->mem || !len)
+        return;
+    for (crec_t *r = t->cap_rec; r; r = r->next) {
+        if (!r->nsvcs)
+            continue;
+        struct svcout *so = &r->out[r->nsvcs - 1];
+        if (so->len + 8 + len > so->cap) {
+            size_t nc = so->cap ? so->cap : 256;
+            while (nc < so->len + 8 + len)
+                nc *= 2;
+            uint8_t *nb = realloc(so->buf, nc);
+            if (!nb)
+                return;
+            so->buf = nb;
+            so->cap = nc;
+        }
+        memcpy(so->buf + so->len, &addr, 4);
+        memcpy(so->buf + so->len + 4, &len, 4);
+        memcpy(so->buf + so->len + 8, src, len);
+        so->len += 8 + len;
+    }
+}
+
 void capture_svc(gtask_t *t, uint32_t imm, bool after)
 {
     for (crec_t *r = t->cap_rec; r; r = r->next)
         record_svc(r, t, imm, after);
+    gmem_set_write_observer(after ? NULL : on_kernel_write, after ? NULL : t);
 }
 
 static void record_svc(crec_t *r, gtask_t *t, uint32_t imm, bool after)
@@ -365,8 +415,13 @@ static void record_svc(crec_t *r, gtask_t *t, uint32_t imm, bool after)
             if (!ns)
                 return;
             r->svcs = ns;
+            struct svcout *no = realloc(r->out, nc * sizeof *no);
+            if (!no)
+                return;
+            r->out = no;
             r->cap_svcs = nc;
         }
+        r->out[r->nsvcs] = (struct svcout){ NULL, 0, 0 };
         r->svcs[r->nsvcs][0] = imm;
         r->svcs[r->nsvcs][1] = g->r[7];
         r->svcs[r->nsvcs][2] = g->r[0];

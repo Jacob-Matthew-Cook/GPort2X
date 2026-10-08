@@ -88,6 +88,13 @@ int gmem_read(gmem_t *m, gaddr_t addr, void *dst, uint32_t len);
 int gmem_write(gmem_t *m, gaddr_t addr, const void *src, uint32_t len);
 int gmem_memset(gmem_t *m, gaddr_t addr, uint8_t value, uint32_t len);
 
+/* An observer of those bulk writes (the syscall layer's stores into guest
+ * memory: a read()'s data, a stat buffer ...), called after each successful
+ * gmem_write (gmem_memset writes through it). One per process; the call
+ * capture sets it around a syscall. NULL removes it. */
+typedef void (*gmem_write_observer_fn)(void *ctx, gmem_t *m, gaddr_t addr, const void *src, uint32_t len);
+void gmem_set_write_observer(gmem_write_observer_fn fn, void *ctx);
+
 /* Sized access for the CPU. The address is used exactly as given (the CPU
  * applies the ARMv4 alignment rules before calling); an access that crosses
  * a page is served bytewise. Checks R for loads, W for stores, X for fetches. */
