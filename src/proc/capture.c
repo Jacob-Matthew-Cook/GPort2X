@@ -9,7 +9,10 @@
  * with their results. The record ends when the task returns to the entry's
  * lr with the entry's sp (a breakpoint there): r0/r1 are its results. A call
  * that runs past capture_budget instructions, execs or leaves another way is
- * written as incomplete. One JSON object per line:
+ * written as incomplete. Records nest: a call of another chosen function
+ * inside one being recorded starts its own record (a never-returning caller
+ * such as the main loop must not hide its callees); every access and syscall
+ * goes to every open record of the task. One JSON object per line:
  *
  *   {"addr":A,"seq":K,"pid":P,"flip":F,"insns":N,"complete":true,
  *    "regs":[r0..r15],"cpsr":C,"ret":[r0,r1],
@@ -39,6 +42,7 @@ typedef struct cpage {
 } cpage_t;
 
 typedef struct crec {
+    struct crec *next;        /* the task's open records, innermost first */
     gtask_t *task;
     cpu_t *cpu;
     unsigned site;            /* index into capture.addrs */
@@ -93,9 +97,8 @@ static cpage_t *page_get(crec_t *r, uint32_t page)
     return p;
 }
 
-static void on_access(void *ctx, gaddr_t addr, unsigned size, uint32_t value, bool write)
+static void record_access(crec_t *r, gaddr_t addr, unsigned size, uint32_t value, bool write)
 {
-    crec_t *r = ctx;
     for (unsigned i = 0; i < size; i++) {
         gaddr_t a = addr + i;
         cpage_t *p = page_get(r, a / CAP_PAGE);
@@ -111,6 +114,12 @@ static void on_access(void *ctx, gaddr_t addr, unsigned size, uint32_t value, bo
             p->flags[o] = F_READ;
         }
     }
+}
+
+static void on_access(void *ctx, gaddr_t addr, unsigned size, uint32_t value, bool write)
+{
+    for (crec_t *r = ((gtask_t *)ctx)->cap_rec; r; r = r->next)
+        record_access(r, addr, size, value, write);
 }
 
 static int page_cmp(const void *a, const void *b)
@@ -159,17 +168,23 @@ static void rec_free(crec_t *r)
     free(r);
 }
 
-static void finish(gsys_t *s, gtask_t *t, bool complete)
+static void finish(gsys_t *s, gtask_t *t, crec_t *r, bool complete)
 {
     struct capture *c = s->cap;
-    crec_t *r = t->cap_rec;
-    t->cap_rec = NULL;
+    for (crec_t **pp = &t->cap_rec; *pp; pp = &(*pp)->next)
+        if (*pp == r) {
+            *pp = r->next;
+            break;
+        }
     if (r->cpu == t->cpu) {
-        cpu_set_watch(r->cpu, NULL, NULL);
-        bool ret_is_site = false;
+        if (!t->cap_rec)
+            cpu_set_watch(r->cpu, NULL, NULL);
+        bool keep = false; /* another site, or another open record, still needs this breakpoint */
         for (unsigned i = 0; i < c->n; i++)
-            ret_is_site |= c->addrs[i] == r->ret_pc;
-        if (!ret_is_site)
+            keep |= c->addrs[i] == r->ret_pc;
+        for (crec_t *o = t->cap_rec; o; o = o->next)
+            keep |= o->ret_pc == r->ret_pc;
+        if (!keep)
             cpu_remove_breakpoint(r->cpu, r->ret_pc);
     }
     cpage_t **pages = malloc((r->npages ? r->npages : 1) * sizeof *pages);
@@ -251,8 +266,8 @@ void capture_destroy(gsys_t *s)
     if (!c)
         return;
     for (gtask_t *t = s->tasks; t; t = t->next)
-        if (t->cap_rec)
-            finish(s, t, false);
+        while (t->cap_rec)
+            finish(s, t, t->cap_rec, false);
     for (unsigned i = 0; i < c->n; i++)
         gp_info("capture: %08x: %u call(s) seen, %u recorded", c->addrs[i], c->seen[i], c->written[i]);
     fclose(c->out);
@@ -266,8 +281,8 @@ void capture_destroy(gsys_t *s)
 void capture_before_slice(gsys_t *s, gtask_t *t)
 {
     struct capture *c = s->cap;
-    if (t->cap_rec && t->cap_rec->cpu != t->cpu) /* exec replaced the image mid-call */
-        finish(s, t, false);
+    while (t->cap_rec && t->cap_rec->cpu != t->cpu) /* exec replaced the image mid-call */
+        finish(s, t, t->cap_rec, false);
     if (t->cap_armed == t->cpu)
         return;
     t->cap_armed = t->cpu;
@@ -279,29 +294,36 @@ void capture_before_slice(gsys_t *s, gtask_t *t)
 
 void capture_after_slice(gsys_t *s, gtask_t *t)
 {
-    crec_t *r = t->cap_rec;
-    if (r && (t->cpu != r->cpu || cpu_insn_count(t->cpu) - r->insns0 > s->cap->budget ||
-              t->state == TASK_ZOMBIE || t->state == TASK_DEAD))
-        finish(s, t, false);
+    for (crec_t *r = t->cap_rec, *next; r; r = next) {
+        next = r->next;
+        if (t->cpu != r->cpu || cpu_insn_count(t->cpu) - r->insns0 > s->cap->budget ||
+            t->state == TASK_ZOMBIE || t->state == TASK_DEAD)
+            finish(s, t, r, false);
+    }
 }
 
 bool capture_breakpoint(gsys_t *s, gtask_t *t, gaddr_t pc)
 {
     struct capture *c = s->cap;
     const cpu_regs_t *g = cpu_regs(t->cpu);
-    crec_t *r = t->cap_rec;
-    if (r && pc == r->ret_pc && g->r[13] == r->entry_sp) {
-        finish(s, t, true);
-        return true;
+    crec_t *r;
+    bool ret_hit = false;
+    for (crec_t *o = t->cap_rec, *next; o; o = next) {
+        next = o->next;
+        if (pc == o->ret_pc && g->r[13] == o->entry_sp) {
+            finish(s, t, o, true);
+            ret_hit = true;
+        }
     }
     unsigned site = c->n;
     for (unsigned i = 0; i < c->n; i++)
         if (c->addrs[i] == pc)
             site = i;
     if (site == c->n)
-        return r != NULL; /* the return breakpoint, hit by a nested frame */
-    if (r) /* re-entry (recursion) or another site inside an active call */
-        return true;
+        return ret_hit || t->cap_rec != NULL; /* a return breakpoint (possibly a nested frame's) */
+    for (crec_t *o = t->cap_rec; o; o = o->next)
+        if (o->site == site) /* recursion: the outer call's record covers it */
+            return true;
     unsigned k = c->seen[site]++;
     if (k < c->skip || c->written[site] >= c->max)
         return true;
@@ -318,17 +340,23 @@ bool capture_breakpoint(gsys_t *s, gtask_t *t, gaddr_t pc)
     r->entry_sp = g->r[13];
     r->insns0 = cpu_insn_count(t->cpu);
     r->flip = s->dev ? gpdev_flip_count(s->dev) : 0;
+    r->next = t->cap_rec;
     t->cap_rec = r;
     cpu_add_breakpoint(t->cpu, r->ret_pc);
-    cpu_set_watch(t->cpu, on_access, r);
+    cpu_set_watch(t->cpu, on_access, t);
     return true;
 }
 
+static void record_svc(crec_t *r, gtask_t *t, uint32_t imm, bool after);
+
 void capture_svc(gtask_t *t, uint32_t imm, bool after)
 {
-    crec_t *r = t->cap_rec;
-    if (!r)
-        return;
+    for (crec_t *r = t->cap_rec; r; r = r->next)
+        record_svc(r, t, imm, after);
+}
+
+static void record_svc(crec_t *r, gtask_t *t, uint32_t imm, bool after)
+{
     const cpu_regs_t *g = cpu_regs(t->cpu);
     if (!after) {
         if (r->nsvcs == r->cap_svcs) {
