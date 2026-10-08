@@ -1,0 +1,41 @@
+# Status against the specification (2026-10-08)
+
+Spec section numbers refer to `docs/HARNESS_SPEC.md` of the main project.
+"Verified" means an executable check in `tests/` (unit test, qemu-arm
+differential, or an oracle frame comparison); the evidence rung is given.
+
+| spec | item | state | evidence |
+|---|---|---|---|
+| 1.1, 1.4 | OABI ET_EXEC loader at 0x8000, RWX first segment, brk at 0x00F24000, 2.4 layout, stack below 0xC0000000, thread stacks at the hints | done | `tests/elf`, boot trace (brk, mmaps, clone stacks at 0xBF600000...) |
+| 1.2, 5 | ARMv4T interpreter: rotated unaligned loads, forced-aligned stores, PC+8/+12, SWP, no Thumb | done | `tests/cpu` (hand cases + 400 random sequences vs Unicorn) |
+| 1.3 | svc trap (interpreter hook); native engine | done: the interpreter's hook; the native engine (armhf build on an AArch64 kernel with compat: seccomp SIGSYS for the guest's calls, host threads and processes, `docs/NATIVE_ENGINE.md`) | `tests/sys` under both engines, `tests/native` (`make test-native`) |
+| 1.5, 3.2 | one 32 MB bank + 64 KB register file, aliased windows, offset validation | done | `tests/dev` |
+| 1.6 | RAM budget ≤ 80 MB | met | mission 2 run: 69.5 MB RSS for the whole harness (interpreter engine, 32 MB bank included) |
+| 2 | 79 OABI syscalls + EABI, OABI stat64, old mmap, time, getrlimit, sigaction family, dirents, poll/select, mount | done (~150 calls) | `tests/sys` vs qemu-arm (EABI and OABI), boot traces |
+| 3.3 | fb0/fb1: FSCREENINFO, RW mapping into the bank | done (fb1 at 0x03381000, OPEN-6) | `tests/dev`, boot |
+| 3.4, 3.5 | OSS dsp with blocking 8 x 512 writes, mixer gain; reopen after changeclock (OPEN-25 resolved) | done. Natively the device model is shared memory, so the game's process and GPort2X's own see one DSP ring and mixer; with SDL the audio device's callback pulls from the ring (`--wav` records what it plays) | `tests/dev`, WAV output, dev trace, `test_native_game` (audio from the game's own process) |
+| 3.6, 3.7 | /dev/mmuhack; changeclock through sh | done | boot trace |
+| 3.8, 3.9 | GPIO (SDL layout), batt, cx25874, console VTs | done for the menu's needs (OPEN-7/8 values assumed) | `test_menu` |
+| 4 | registers: TCOUNT, GPIO, CLKCHGSTREG, DPC_CNTL, latched memory; flip = scanout write | done | `tests/dev`, 301/301 frames |
+| 6 | copy protection: genuine values reported, never bypassed; C4 fails as genuine | done | `tests/card` (genuine image), boot trace |
+| 7.1-7.3 | rc.sysinit, irqbattery, gp2xmenu, autorun, explorer, Game-section launch, ENOEXEC fallback, stub, tmpfs | done | `test_menu`, `test_chain` |
+| 7.6 P1-P4 | menu renders, navigation, launch, game to flip 300 identical | done | `test_menu`, `test_boot`, `test_chain` |
+| 7.6 P5 | QUIT returns to the menu | done: QUIT, confirm, clean exit (the hardware init runs again before the atexit unmapping, so the C4 zeroing has no effect: no fault), the `.gpe` script relaunches the menu, autorun restarts the game | `test_quit` |
+| 8.4 gate 2 | flips 0..300 identical | done | `test_boot`, `test_chain` |
+| 8.4 gate 3 | 7 replays to 2,990 / RAMPAGE to 4,990 | done by state diff: all 7 replays at flip 2,990 have the simulation state identical to the oracle's (`tools/harness/statediff_run.py` in the decomp repo; the object pool differs only in mixer voice handles, the trigger tables only in sound handles, the random-table indices are equal), the rest being audio-thread/thread-library state. Frames: RAMPAGE identical through the intro, the EXTRAS -> REPLAYS navigation and the list/loading screens (2,178 flips compared); inside a replay the overlays are audio-driven (a message leaves the screen when its speech has played out through the DAC, never on the thread-less oracle), and in REMOTE DESTRUCTION the subtitle halo's S2 jitter then offsets every cosmetic random draw (debris, puffs, glow) from flip 2,426 while the simulation stays identical | `test_rampage`, `statediff_run.py` |
+| 8.4 gate 4 | mission 2 identical | done to flip 3,399 (menu navigation, mission start at ~2,304, ~1,100 flips of play); the intro-to-menu transition (1,825..1,977, a wait on the DAC-paced stream) is excluded. State diffs of STORY missions 1-6 at flip 3,400: simulation state identical (voice handles and the audio callback's idle-dim counter aside). Mission 2 to flip 10,000 with a volume key every 1,500 flips: state identical (all three random-table indices equal), frames identical except the transition window and 8,801..8,953, where the mission has ended, the game is back on the STORY menu and a new music track's 'now playing' banner slides in (music plays here, not in the thread-less oracle); no idle dim, so the volume keys reset the idle counter as the callback's mask says | `test_mission2`, `statediff_run.py` |
+| 8.2 idle dim | the game dims the screen after 5,161 audio fills without a pad press | reproduced, since the game's audio thread runs here: STORY mission 1 (last press at flip 2,260) is dimmed for flips 3,986..4,130 and identical to the oracle before and after; the oracle never dims. Mission frame gates end within ~1,700 flips of the last press | `statediff_run.py --dump` |
+| 1.2 speed | interpreter throughput | JIT for x86-64 and AArch64 (docs/JIT.md). x86-64: 600 boot flips in about 1.4 s on an i7-9700F (13.3 s originally, 6.1 s interpreted with the caches). AArch64 under qemu-user: 12.1 s against 44.6 s interpreted, frames identical; on the RG353M's Cortex-A55 the game reaches 8 fps (its full pace is 25.4), hence the native engine there. `--no-jit` keeps the interpreter | `make test`, `make test-aarch64` |
+| 8.2 real time | the real clock keeps pace | RAMPAGE replay to 3,000 flips on the real clock: 0 audio underruns (1,335 before the fixes), sleeps and poll timeouts end on 2.4 jiffy ticks, so the intro runs at 40 ms and gameplay at 50 ms per frame (the game scales its simulation by the measured delta); gameplay needs 67 M guest instructions/s (83 M/s worst second) | `--clock real --flip-log` |
+| 5.3 / OPEN-13 | unaligned accesses | dynamic census with the interpreter: 0 unaligned word, halfword or LDM/STM accesses over boot, 6 missions (6,000 flips), 7 replays (2,991 flips) and 300 M instructions of the firmware menu | `--trace unaligned` |
+| 5.2, 5.6 | native-engine instruction emulation | `aemu`: one instruction on SIGILL/SIGBUS (SWP as a host atomic exchange, FPA and the rest through the interpreter over host memory); in use under the native engine (LinuxThreads' SWP in the game and the menu, FPA in the firmware's libraries) | `tests/aemu`, `test_native_game`, `test_native_menu` |
+| 9 #19 | FPA emulation | transfers exact; arithmetic in long double (not NWFPE's SoftFloat) | menu runs; libm fidelity unmeasured (OPEN-22) |
+| 9 #12 | display front end | SDL2 front end: window or fullscreen (integer scaling), keyboard and game controllers by button position, a quit combination, audio pulled by the device's callback. Built for aarch64 and, with the native engine, for armhf against SDL 2; in use on the RG353M (ROCKNIX: Wayland, PipeWire). Compiled out on this x86 host (no amd64 SDL2 dev package) | by hand on the device |
+| 8.3 | aarch64 CI stand-in | an emulated arm64 VM (`qemu-system-aarch64 -M virt -cpu max`, Ubuntu 24.04 arm64) builds the armhf binaries and runs `make test-native` (`tools/test_native_remote.sh`) | `make test-native` |
+| 8.2 real time on hardware | Payback on a handheld | Anbernic RG353M (RK3566, Cortex-A55, ROCKNIX): the native engine runs the genuine chain at the game's full pace (25.4 fps, 39.4 ms frames, set by the 2.4 timer ticks) with no audio underrun; the interpreter with its AArch64 JIT reaches 8 fps | by hand on the device; `--flip-log` |
+| — | PortMaster port | `port/` and `tools/make_port.sh`: launchers for the game and the firmware menu with either engine, controls by button position, the user's firmware and card image read-only, saves in the port's folder; no game or firmware data packaged (`LEGAL.md`) | installed and run on the RG353M |
+
+Deviations from the spec text, recorded in its section 12: the flip rule,
+fb1's address, FPA transfers being B priority, kernel-complete writes, 2.4
+jiffy rounding of sleeps, `/dev/tty` as the console, and OPEN-5/18/19/20/25
+closed.

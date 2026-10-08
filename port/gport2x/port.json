@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "name": "gport2x.zip",
+  "items": [
+    "GPort2X - Payback.sh",
+    "GPort2X - GP2X Menu.sh",
+    "GPort2X Native - Payback.sh",
+    "GPort2X Native - GP2X Menu.sh",
+    "gport2x"
+  ],
+  "items_opt": null,
+  "attr": {
+    "title": "GPort2X: Payback (GP2X)",
+    "porter": ["Jacob Cook"],
+    "desc": "A GP2X user-mode compatibility layer that runs Payback from your own GP2X SD card image, with your own GP2X firmware, read-only and frame-identical to the original's behaviour. Launch the game directly or boot the GP2X menu.",
+    "inst": "Copy your GP2X firmware dump (the root filesystem: bin, lib, usr/gp2x, ...) into ports/gport2x/firmware/ and your Payback SD card image (.img) into ports/gport2x/card/. Nothing from either is included.",
+    "genres": ["action"],
+    "image": null,
+    "rtr": false,
+    "exp": true,
+    "runtime": null,
+    "reqs": [],
+    "arch": ["aarch64"]
+  }
+}

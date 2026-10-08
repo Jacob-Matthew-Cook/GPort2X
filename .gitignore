@@ -1,0 +1,15 @@
+build/
+*.o
+*.a
+*.ppm
+*.wav
+# user images and dumps never belong in the repo (LEGAL.md rule 5)
+*.img
+*.bin
+*.gpe
+*.tgz
+*.zip
+/run/
+/scratch/
+__pycache__/
+dist/
