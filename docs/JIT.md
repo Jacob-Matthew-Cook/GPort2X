@@ -1,4 +1,4 @@
-# JIT plan for the interpreter engine
+# The interpreter's JIT
 
 Status: two backends, x86-64 (src/cpu/jit_x86_64.inc) and AArch64
 (src/cpu/jit_aarch64.inc), sharing blocks, lookup and invalidation
