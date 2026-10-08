@@ -70,8 +70,11 @@ game state at one frame (a "state diff", see [tests/README.md](../tests/README.m
    `--wav` records what it plays.
 3. **QUIT.** QUIT and confirm exit cleanly: the hardware set-up runs again
    before the exit unmaps it, so the protection check's zeroing has no effect
-   and nothing faults. The card's `.gpe` script relaunches the menu, and
-   autorun restarts the game.
+   and nothing faults. The card's `.gpe` script then starts the menu, whose
+   autorun (`[main] autorun` in `/usr/gp2x/common.ini`, on by default and
+   checked at every start, not only at boot) starts the game again, as on a
+   GP2X with this card. `--exit-at-menu` ends the run there instead, with
+   status 0; the port's Payback launchers use it.
 4. **Replays.** All seven replays at frame 2,990 have the simulation state of
    the reference (the object pool differs only in mixer voice handles, the
    trigger tables only in sound handles, and the random-number indices are
@@ -128,7 +131,8 @@ game state at one frame (a "state diff", see [tests/README.md](../tests/README.m
 13. **PortMaster port.** `port/` and `tools/make_port.sh`: launchers for the
     game and the firmware menu with either engine, controls by button
     position, the player's firmware and card image read-only, saves in the
-    port's folder. No game or firmware data is packaged ([LEGAL.md](../LEGAL.md)).
+    port's folder; QUIT in the game returns to the handheld's menu (note 3).
+    No game or firmware data is packaged ([LEGAL.md](../LEGAL.md)).
 
 ## Deviations from the specification
 

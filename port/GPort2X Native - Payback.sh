@@ -31,7 +31,10 @@ gport2x_check_files || { pm_finish; exit 1; }
 
 gport2x_hotkeys
 pm_platform_helper "$GAMEDIR/${GPORT2X_BIN#./}"
-$GPORT2X_BIN "${GPORT2X_ARGS[@]}" \
+# QUIT in the game's own menu ends the port: after the game the card's
+# Payback.gpe starts the GP2X menu, whose autorun (on by default) would start
+# the game again, so --exit-at-menu ends the run there instead
+$GPORT2X_BIN "${GPORT2X_ARGS[@]}" --exit-at-menu \
     --cwd /mnt/sd/Payback /bin/sh /mnt/sd/Payback/Payback.gpe
 
 pm_finish

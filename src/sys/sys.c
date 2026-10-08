@@ -781,6 +781,13 @@ static int do_execve(call_t *c, gaddr_t pathp, gaddr_t argvp, gaddr_t envpp)
     int r = get_path(c, pathp, path);
     if (r < 0)
         return r;
+    char abs[FS_PATH_MAX];
+    if (c->s->cfg.exit_at_exec && fs_resolve(c->s->fs, &c->t->fs->ctx, path, true, abs) == 0 &&
+        !strcmp(abs, c->s->cfg.exit_at_exec)) {
+        gp_info("pid %d: execve(%s): exits with status 0 instead (--exit-at-menu)", c->t->pid, abs);
+        gtask_exit(c->t, 0);
+        return SYS_NORETURN;
+    }
     char **argv = NULL, **envp = NULL;
     r = get_strv(c, argvp, &argv);
     if (r < 0)

@@ -21,9 +21,12 @@ does) and are the fast ones. The others use GPort2X's interpreter with its
 AArch64 JIT, which works everywhere but runs far slower on handhelds.
 
 * **GPort2X - Payback**: starts the game the way the GP2X menu does, through
-  the card's `Payback.gpe` script and your firmware's shell.
+  the card's `Payback.gpe` script and your firmware's shell. QUIT in the
+  game's main menu brings you back to your handheld's menu.
 * **GPort2X - GP2X Menu**: boots your firmware's menu with the card mounted;
-  start Payback from the Game section.
+  start Payback from the Game section. When you QUIT the game here, the GP2X
+  menu's Auto Run (on by default) starts it again, as on a GP2X with this
+  card; Select + Start held for a second leaves.
 
 ## Controls (by button position)
 

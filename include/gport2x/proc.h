@@ -44,6 +44,10 @@ typedef struct gsys_config {
     unsigned capture_max;       /* calls recorded per address (0 = 3) */
     unsigned capture_skip;      /* calls passed over per address before recording */
     uint64_t capture_budget;    /* instructions before a call is written as incomplete (0 = 200M) */
+    /* For launchers: an execve of this guest path (the firmware menu) exits
+     * the calling process with status 0 instead, so the run ends where the
+     * console would go back to its menu (NULL: execve as always). */
+    const char *exit_at_exec;
 } gsys_config_t;
 
 void gsys_config_default(gsys_config_t *cfg);

@@ -103,6 +103,7 @@ Other useful options (`--help` lists them all):
 | option | does |
 |---|---|
 | `--saves DIR` | keep the card's saves and settings between runs |
+| `--exit-at-menu` | end the run when the program goes back to the firmware menu, instead of starting the menu (for launchers) |
 | `--engine native` | run guest code on the CPU (armhf build, see below) |
 | `--no-jit` | interpret every instruction |
 | `--trace syscall,mmio,fs,dev` | print what the guest does (also `GPORT2X_TRACE`) |

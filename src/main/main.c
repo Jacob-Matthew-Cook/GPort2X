@@ -34,6 +34,8 @@ static void usage(FILE *out)
           "  --inject HOST:GUEST  copy a host file into the guest namespace before starting (e.g. a game ELF)\n"
           "  --root DIR        a writable host directory as the guest root (tests; instead of --firmware)\n"
           "  --cwd PATH        the initial directory (default /)\n"
+          "  --exit-at-menu    a program that returns to the firmware menu (an execve of /usr/gp2x/gp2xmenu)\n"
+          "                    exits instead, so the run ends where the console shows its menu (for launchers)\n"
           "  --argv0 NAME      argv[0] for the program (default: the program path)\n"
           "  --env NAME=VALUE  add to the environment (repeatable; default: the rc.sysinit exports)\n"
           "  --clock MODE      real | step | mainstep (default mainstep in test mode, real otherwise)\n"
@@ -81,7 +83,7 @@ typedef struct opts {
     int nenv;
     uint32_t step;
     int64_t time_value;
-    bool time_set, test, keep_scratch, sdl, no_audio, native, fullscreen;
+    bool time_set, test, keep_scratch, sdl, no_audio, native, fullscreen, exit_at_menu;
     int sdl_scale;
     int dump_every, snapshot_ms;
     uint64_t flips, insns, quantum;
@@ -272,6 +274,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--scratch")) o.scratch = NEXT();
         else if (!strcmp(a, "--inject")) { if (o.ninject < 16) o.inject[o.ninject++] = NEXT(); }
         else if (!strcmp(a, "--cwd")) o.cwd = NEXT();
+        else if (!strcmp(a, "--exit-at-menu")) o.exit_at_menu = true;
         else if (!strcmp(a, "--root")) o.root = NEXT();
         else if (!strcmp(a, "--argv0")) o.argv0 = NEXT();
         else if (!strcmp(a, "--env")) { if (o.nenv < 63) o.env[o.nenv++] = NEXT(); }
@@ -459,6 +462,8 @@ int main(int argc, char **argv)
         cfg.time_value = o.time_set ? o.time_value : 0;
     }
     cfg.max_flips = o.flips;
+    if (o.exit_at_menu)
+        cfg.exit_at_exec = "/usr/gp2x/gp2xmenu";
     cfg.capture = o.capture;
     cfg.capture_out = o.capture_out;
     cfg.capture_exe = o.capture_exe;
