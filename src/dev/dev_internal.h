@@ -22,6 +22,10 @@ typedef struct dsp_state {
     uint64_t last_drain_ns, drain_frac;
     uint64_t opens, underruns;
     size_t want_room; /* bytes a blocked write waits for (0: none) */
+    /* a blocking write larger than the whole buffer: OSS queues it piece by
+     * piece and returns only when all of it is queued; the bytes of it
+     * queued so far (of a write of inflight_n bytes) */
+    size_t inflight, inflight_n;
 } dsp_state_t;
 
 static inline size_t dsp_fill(const dsp_state_t *s)
@@ -33,10 +37,16 @@ struct gpdev {
     gpdev_config_t cfg;
     char dump_dir[FS_PATH_MAX];
     char wav_path[FS_PATH_MAX];
-    gmem_obj_t *upper, *regs;
+    gmem_obj_t *upper, *regs, *blit;
     uint8_t *regfile;                        /* regfile_store, or the native engine's shared memfd */
     uint8_t regfile_store[GP2X_REGS_SIZE];
-    gpaddr_t native_last_scanout;            /* native mode: the scanout pair last seen by gpdev_native_poll */
+    uint8_t *blitregs;                       /* blitregs_store, or shared memory natively */
+    uint8_t blitregs_store[GP2X_BLIT_SIZE];
+    uint32_t blit_seen[32][4];               /* blit set-ups already logged (dst/src/pattern control, ROP control) */
+    unsigned blit_nseen;
+    uint64_t blits;
+    gpaddr_t native_last_scanout;
+    gpaddr_t native_latched_scanout;         /* native, stores trapped: the pair as of its last high-half write */            /* native mode: the scanout pair last seen by gpdev_native_poll */
     bool shared;                             /* native mode: this struct is shared memory, seen by every guest process */
     int fe_pid;                              /* native mode: the process whose tick drains the DAC and runs the front end */
     /* clock */
@@ -46,6 +56,10 @@ struct gpdev {
     uint64_t idle_frac_ns;
     bool cur_is_main;
     bool tcount_started;    /* the frame clock has been read: flips count from here */
+    bool vsync_toggle;
+    uint32_t palette[256];  /* the RGB layer's 8 bpp palette, 0x00RRGGBB */
+    uint8_t pal_index;
+    bool pal_half;          /* the next data write is the R half */      /* stepped clocks: GPIOB's vsync bit, flipped at each read */
     /* pad */
     uint32_t pad;
     struct { int frame; uint32_t mask; } *script;
@@ -88,6 +102,7 @@ static inline void dsp_reset(dsp_state_t *s)
     s->nfrags = 8;
     __atomic_store_n(&s->rpos, __atomic_load_n(&s->wpos, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE); /* empty */
     s->drain_frac = 0;
+    s->inflight = s->inflight_n = 0;
 }
 
 #endif

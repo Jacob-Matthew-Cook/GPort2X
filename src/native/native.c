@@ -55,6 +55,7 @@
 
 #include "gport2x/aemu.h"
 #include "gport2x/cpu.h"
+#include "gport2x/dual940.h"
 #include "gport2x/gmem.h"
 #include "gport2x/log.h"
 #include "../proc/task.h"
@@ -479,10 +480,69 @@ static void on_sigsys(int sig, siginfo_t *si, void *uctx)
     unlock_big();
 }
 
+/* The register-file page with the palette port is read-only in every guest
+ * mapping of the registers (the device must see each write there, and shared
+ * memory shows none): a store to it faults, is emulated on a writable alias
+ * of the register file, and its palette effect applied. Inherited by fork. */
+#define MAX_WATCHED 8
+static gaddr_t watched[MAX_WATCHED];
+static int nwatched;
+static gaddr_t alias_page; /* while one trapped store is emulated: its guest page */
+
+static void regs_mapped(gsys_t *s, gaddr_t addr, uint32_t obj_off, uint32_t len)
+{
+    (void)s;
+    if (obj_off > GPDEV_PALETTE_PAGE || (uint64_t)obj_off + len < GPDEV_PALETTE_PAGE + GP2X_PAGE_SIZE)
+        return;
+    gaddr_t page = addr + (GPDEV_PALETTE_PAGE - obj_off);
+    if (nwatched < MAX_WATCHED && mprotect((void *)(uintptr_t)page, GP2X_PAGE_SIZE, PROT_READ) == 0) {
+        watched[nwatched++] = page;
+        gp_debug("native: pid %d: register page %08x read-only (the palette port's stores trap)", getpid(), page);
+    }
+}
+
 static uint8_t *emu_page(void *ctx, gaddr_t page, int prot)
 {
     (void)ctx;
+    if (alias_page && page == alias_page)
+        return gmem_obj_host(gpdev_regs(ndev)) + GPDEV_PALETTE_PAGE;
     return gmem_page_host(me->mm->mem, page, prot);
+}
+
+/* A store into a watched page: emulate it on the alias, then apply the
+ * palette effect of the accessed register. Lock held. */
+static bool watched_store(gtask_t *t, gaddr_t addr)
+{
+    gaddr_t page = addr & GP2X_PAGE_MASK;
+    int i;
+    for (i = 0; i < nwatched && watched[i] != page; i++)
+        ;
+    if (i == nwatched)
+        return false;
+    cpu_regs_t *r = cpu_regs(t->cpu);
+    uint32_t insn = *(const uint32_t *)(uintptr_t)r->r[15];
+    unsigned size = 0;
+    if ((insn & 0x0E1000F0u) == 0x000000B0u)
+        size = 2; /* STRH */
+    else if ((insn & 0x0C100000u) == 0x04000000u)
+        size = (insn & (1u << 22)) ? 1 : 4; /* STRB / STR */
+    static bool reported;
+    if (!reported) {
+        reported = true;
+        gp_debug("native: pid %d: first trapped register store, pc %08x addr %08x", t->pid, r->r[15], addr);
+    }
+    alias_page = page;
+    gaddr_t fault = 0;
+    enum aemu_result res = aemu_step(myemu, r->r, &r->cpsr, &fault);
+    alias_page = 0;
+    if (res != AEMU_OK)
+        return false;
+    if (size) {
+        uint32_t off = GPDEV_PALETTE_PAGE + ((addr & ~(size - 1u)) - page), v = 0;
+        memcpy(&v, gmem_obj_host(gpdev_regs(ndev)) + off, size);
+        gpdev_palette_store(ndev, off, size, v);
+    }
+    return true;
 }
 
 static void on_sigill_bus(int sig, siginfo_t *si, void *uctx)
@@ -523,6 +583,11 @@ static void on_sigsegv(int sig, siginfo_t *si, void *uctx)
     lock_big();
     gtask_t *t = me;
     ctx_to_task(mc, t);
+    if (watched_store(t, addr)) {
+        task_to_ctx(t, mc);
+        unlock_big();
+        return;
+    }
     if (gmm_grow_stack(t, addr) != 0) {
         gp_warn("native: pid %d data abort at pc %08x addr %08x lr %08x -> SIGSEGV", t->pid, pc, addr,
                 (unsigned)mc->arm_lr);
@@ -664,6 +729,24 @@ static void *clock_main(void *arg)
     return NULL;
 }
 
+/* The ARM940T (src/proc/dual940.c), on a host thread of the first process:
+ * it only touches the shared bank and register file, so it needs no lock. */
+static void *core940_main(void *arg)
+{
+    (void)arg;
+    sigset_t m;
+    sigfillset(&m);
+    pthread_sigmask(SIG_BLOCK, &m, NULL);
+    dual940_t *c = dual940_create(ndev);
+    for (;;) {
+        if (!c || !dual940_step(c, 200000)) {
+            struct timespec ts = { 0, 2000000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
 /* The front end (SDL: display, input, its events) on a thread of its own,
  * never holding the lock: a display update may block (a hidden window). */
 static native_frontend_fn fe_start;
@@ -710,11 +793,14 @@ int native_run(gsys_t *s, gtask_t *t, gpdev_t *dev, native_frontend_fn fe, void 
             install(sig, on_forward);
     setpgid(0, 0); /* our own process group, so a quit ends every guest process */
     gpdev_set_frontend_process(ndev, getpid()); /* this process drains the shared DAC to the front end */
-    pthread_t clock_th, fe_th;
+    s->regs_mapped_fn = regs_mapped;
+    pthread_t clock_th, fe_th, core940_th;
     if (pthread_create(&clock_th, NULL, clock_main, NULL) != 0 || pthread_create(&fe_th, NULL, frontend_main, NULL) != 0) {
         gp_error("native engine: cannot start the clock and front-end threads");
         return -1;
     }
+    if (pthread_create(&core940_th, NULL, core940_main, NULL) != 0)
+        gp_warn("native engine: no ARM940T thread");
     int r = install_filter();
     if (r < 0) {
         gp_error("native engine: seccomp filter refused: %s", strerror(-r));

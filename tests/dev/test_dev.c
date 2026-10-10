@@ -192,6 +192,16 @@ int main(void)
     for (int i = 0; i < 30; i++) g32(0x43000A00);
     gpdev_tick(d);
     CHECK(fs_file_write(dsp, period, 1024) == 1024, "room after more time");
+    /* a blocking write larger than the whole buffer: blocks (never a short
+     * count) until all of it is queued, then returns the whole count */
+    static uint8_t big[6000];
+    int64_t wr = 0;
+    int rounds = 0;
+    for (; rounds < 400 && (wr = fs_file_write(dsp, big, sizeof big)) == -EAGAIN; rounds++) {
+        for (int i = 0; i < 30; i++) g32(0x43000A00);
+        gpdev_tick(d);
+    }
+    CHECK(wr == (int64_t)sizeof big && rounds > 0, "oversized write: %lld after %d blocked round(s)", (long long)wr, rounds);
     CHECK(gpdev_audio_bytes_out(d) > 0, "audio emitted");
     /* mixer */
     fs_file_t *mix = openp("/mixer", GUEST_O_RDWR);
@@ -215,6 +225,44 @@ int main(void)
     fs_file_unref(gp);
     fs_stat_t st;
     CHECK(fs_stat(fs, &ctx, "/mmcsd/disc0/part1", true, &st) == 0 && S_ISBLK(st.mode), "block node present");
+
+    /* the 2D blitter (0xE0020000): a fill, a copy, a copy with a transparent colour */
+    CHECK(fs_file_mmap(mem, 0xE0020000, 0x1000, GMEM_PROT_RW, true, &obj, &off) == 0 && obj == gpdev_blitter(d) && off == 0, "blitter registers map");
+    gmem_map_obj(m, 0x44000000, 0x1000, GMEM_PROT_RW, obj, 0); gmem_obj_release(obj);
+    for (int i = 0; i < 64; i++) gmem_st16(m, 0x42200000 + 2 * i, 0x5555); /* phys 0x03200000: 4 rows of 16 px */
+    gmem_st32(m, 0x44000000, 1u << 5 | 1u << 6);         /* DSTCTRL: 16 bpp, enabled */
+    gmem_st32(m, 0x44000004, 0x03200000); gmem_st32(m, 0x44000008, 32);
+    gmem_st32(m, 0x4400000C, 0); gmem_st32(m, 0x44000020, 0); gmem_st32(m, 0x44000024, 0x1234);
+    gmem_st32(m, 0x4400002C, 2u << 16 | 3);              /* 3 x 2 */
+    gmem_st32(m, 0x44000030, 1u << 9 | 1u << 10 | 0xF0); /* PATCOPY */
+    gmem_st32(m, 0x44000034, 1);
+    CHECK(g32(0x44000034) == 0, "blit done at once");
+    CHECK(g16(0x42200000) == 0x1234 && g16(0x42200004) == 0x1234 && g16(0x42200006) == 0x5555 && g16(0x42200024) == 0x1234 &&
+          g16(0x42200040) == 0x5555, "fill: 3 x 2 at stride 32");
+    gmem_st16(m, 0x42200040, 0x0001); gmem_st16(m, 0x42200042, 0xF81F); gmem_st16(m, 0x42200044, 0x0002);
+    gmem_st32(m, 0x4400000C, 1u << 5 | 1u << 7 | 1u << 8); /* SRCCTRL: 16 bpp, enabled, from memory */
+    gmem_st32(m, 0x44000010, 0x03200040); gmem_st32(m, 0x44000014, 32);
+    gmem_st32(m, 0x4400002C, 1u << 16 | 3);
+    gmem_st32(m, 0x44000030, 1u << 9 | 1u << 10 | 0xCC); /* SRCCOPY */
+    gmem_st32(m, 0x44000034, 1);
+    CHECK(g16(0x42200000) == 0x0001 && g16(0x42200002) == 0xF81F && g16(0x42200004) == 0x0002, "copy");
+    for (int i = 0; i < 3; i++) gmem_st16(m, 0x42200000 + 2 * i, 0x7777);
+    gmem_st32(m, 0x44000030, 0xF81Fu << 16 | 1u << 11 | 1u << 9 | 1u << 10 | 0xCC); /* transparent F81F */
+    gmem_st32(m, 0x44000034, 1);
+    CHECK(g16(0x42200000) == 0x0001 && g16(0x42200002) == 0x7777 && g16(0x42200004) == 0x0002, "transparent copy");
+    /* vsync: GPIOB bit 4 changes at every read on the stepped clocks */
+    uint32_t v1 = g16(0x43001182), v2 = g16(0x43001182);
+    CHECK(((v1 ^ v2) & 0x10) != 0, "vsync bit toggles (%04x %04x)", v1, v2);
+    /* 8 bpp RGB layer through the palette: index, G<<8|B then R; a 32-bit write is one entry */
+    gmem_st16(m, 0x43002958, 5); gmem_st16(m, 0x4300295A, 0x2040); gmem_st16(m, 0x4300295A, 0x00F8);
+    gmem_st16(m, 0x43002958, 7); gmem_st32(m, 0x43002958, 0x00FF0000);
+    gmem_st16(m, 0x430028DA, 0x02AB); gmem_st16(m, 0x4300290C, 320);
+    gmem_st8(m, 0x42100000, 0); gmem_st8(m, 0x42100001, 5); gmem_st8(m, 0x42100000 + 320, 7);
+    static uint16_t shown[320 * 240];
+    CHECK(gpdev_read_page(d, 0x03100000, shown) == 0 && shown[1] == 0xF908 && shown[320] == 0xF800, "8 bpp page: %04x %04x", shown[1], shown[320]);
+    gmem_st16(m, 0x430028DA, 0x04AB); gmem_st16(m, 0x4300290C, 640);
+    gmem_st16(m, 0x42100000, 0xABCD);
+    CHECK(gpdev_read_page(d, 0x03100000, shown) == 0 && shown[0] == 0xABCD, "back to 16 bpp");
 
     fs_file_unref(fb0); fs_file_unref(fb1); fs_file_unref(mem); fs_file_unref(mix);
     gpdev_destroy(d);

@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "task.h"
+#include "gport2x/dual940.h"
 
 #define SIGBIT(s) (1ull << ((s) - 1))
 #define SIG_UNSTOPPABLE (SIGBIT(GSIGKILL) | SIGBIT(GSIGSTOP))
@@ -145,6 +146,7 @@ void gsys_destroy(gsys_t *s)
     if (!s)
         return;
     capture_destroy(s);
+    dual940_destroy(s->core940);
     while (s->tasks) {
         gtask_t *t = s->tasks;
         s->tasks = t->next;
@@ -393,7 +395,9 @@ static int load_image(gtask_t *t, const uint8_t *data, size_t len, const char *p
     if (!mm)
         return -ENOMEM;
     elf_image_t img, interp_img;
-    int r = elf_load(mm->mem, data, len, 0, &img);
+    /* A position-independent program run directly (ld.so as a command) goes
+     * where Linux 2.4's binfmt_elf puts it: ELF_ET_DYN_BASE, 2/3 of TASK_SIZE. */
+    int r = elf_load(mm->mem, data, len, GUEST_ET_DYN_BASE, &img);
     if (r != GP_OK) {
         gmm_unref(mm);
         return r == GP_ERR_NOMEM ? -ENOMEM : -ENOEXEC;
@@ -983,6 +987,9 @@ int gmm_mmap(gtask_t *t, gaddr_t addr, uint32_t len, int prot, int flags, int fd
         if (r < 0)
             return r;
         r = gmem_map_obj(mm->mem, addr, len, gprot, obj, obj_off);
+        gsys_t *s = t->sys;
+        if (r == GP_OK && s->regs_mapped_fn && s->dev && obj == gpdev_regs(s->dev))
+            s->regs_mapped_fn(s, addr, obj_off, len);
         gmem_obj_release(obj);
     }
     if (r != GP_OK)
@@ -1221,6 +1228,13 @@ enum gsys_stop gsys_run(gsys_t *s, int *wait_status)
         reap_dead(s);
         if (!any_alive)
             break;
+        /* the ARM940T runs alongside: a slice per round, and a round in which
+         * only it ran is progress, not a deadlock */
+        if (s->dev && !s->core940)
+            s->core940 = dual940_create(s->dev);
+        bool ran940 = s->core940 && dual940_step(s->core940, s->cfg.quantum ? s->cfg.quantum : 20000);
+        if (ran940)
+            idle_rounds = 0;
         if (any_ran) {
             idle_rounds = 0;
             /* every running task only slept: nothing will move the timer, so
@@ -1230,7 +1244,8 @@ enum gsys_stop gsys_run(gsys_t *s, int *wait_status)
             continue;
         }
         /* idle: every live task waits. Let time pass. */
-        idle_rounds++;
+        if (!ran940)
+            idle_rounds++;
         uint64_t now = gsys_now_ns(s);
         uint64_t step = have_deadline ? (earliest > now ? earliest - now : 0) : 1000000ull;
         if (s->dev) { /* the next time the DAC frees a fragment, if a writer may be waiting for one */
@@ -1240,6 +1255,8 @@ enum gsys_stop gsys_run(gsys_t *s, int *wait_status)
         }
         if (step > 50000000ull)
             step = 50000000ull;
+        if (ran940) /* the 940's slice is ~100 us of a 200 MHz core: time moves on by that much */
+            step = step > 100000ull ? 100000ull : step;
         if (!s->dev || gpdev_sleeps_are_real(s->dev)) {
             if (step) {
                 struct timespec ts = { (time_t)(step / 1000000000ull), (long)(step % 1000000000ull) };

@@ -61,6 +61,12 @@ void gpdev_destroy(gpdev_t *d);
 
 gmem_obj_t *gpdev_upper_bank(gpdev_t *d);
 gmem_obj_t *gpdev_regs(gpdev_t *d);
+uint16_t gpdev_reg_peek16(const gpdev_t *d, uint32_t off); /* the register file, without side effects */
+/* The palette port's effect of a register write (the native engine calls it
+ * for writes it traps); true when the write does not reach the register file. */
+bool gpdev_palette_store(gpdev_t *d, uint32_t off, unsigned size, uint32_t value);
+#define GPDEV_PALETTE_PAGE 0x2000u /* the register-file page with the palette port */
+gmem_obj_t *gpdev_blitter(gpdev_t *d); /* the 2D blitter's register page (0xE0020000) */
 /* Registers every GP2X device node (and the devfs aliases) in devfs. */
 int gpdev_register_nodes(gpdev_t *d, fs_backend_t *devfs);
 

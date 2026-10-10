@@ -83,6 +83,12 @@ static int mem_mmap(fs_file_t *f, uint64_t off, uint32_t len, int prot, bool sha
         gp_trace(GP_TRACE_DEV, "/dev/mem map phys %08llx len %x (registers)", (unsigned long long)off, len);
         return 0;
     }
+    if (off >= GP2X_BLIT_PHYS && off + len <= (uint64_t)GP2X_BLIT_PHYS + GP2X_BLIT_SIZE) {
+        *obj = gmem_obj_ref(gpdev_blitter(d));
+        *obj_off = (uint32_t)(off - GP2X_BLIT_PHYS);
+        gp_trace(GP_TRACE_DEV, "/dev/mem map phys %08llx len %x (blitter)", (unsigned long long)off, len);
+        return 0;
+    }
     gp_warn("/dev/mem: mapping of phys %08llx len %x refused (outside the GP2X model)", (unsigned long long)off, len);
     return -EINVAL;
 }
@@ -252,6 +258,8 @@ static size_t dsp_capacity(const dsp_state_t *s)
     return cap > DSP_RING_MAX ? DSP_RING_MAX : cap;
 }
 
+static void dsp_queue(dsp_state_t *s, const void *buf, size_t n);
+
 static int64_t dsp_write(fs_file_t *f, int64_t off, const void *buf, size_t n)
 {
     (void)off;
@@ -265,13 +273,31 @@ static int64_t dsp_write(fs_file_t *f, int64_t off, const void *buf, size_t n)
             s->want_room = n; /* OSS blocks until the whole write fits; the scheduler wakes it then */
             return -EAGAIN;
         }
-    } else if (room == 0) {
-        s->want_room = s->fragsize;
-        return -EAGAIN;
+    } else {
+        /* larger than the buffer: queue what fits and block for the rest,
+         * then return the whole count (each retry repeats the same call) */
+        size_t done = s->inflight_n == n ? s->inflight : 0;
+        size_t m = n - done < room ? n - done : room;
+        dsp_queue(s, (const uint8_t *)buf + done, m);
+        done += m;
+        if (done < n) {
+            s->inflight = done;
+            s->inflight_n = n;
+            size_t want = s->fragsize ? s->fragsize : 1;
+            s->want_room = n - done < want ? n - done : want;
+            return -EAGAIN;
+        }
+        s->inflight = s->inflight_n = 0;
+        s->want_room = 0;
+        return (int64_t)n;
     }
     s->want_room = 0;
-    if (n > room)
-        n = room;
+    dsp_queue(s, buf, n);
+    return (int64_t)n;
+}
+
+static void dsp_queue(dsp_state_t *s, const void *buf, size_t n)
+{
     const uint8_t *src = buf;
     size_t tail = (size_t)(s->wpos % DSP_RING_MAX);
     size_t first = DSP_RING_MAX - tail;
@@ -281,7 +307,6 @@ static int64_t dsp_write(fs_file_t *f, int64_t off, const void *buf, size_t n)
     if (n > first)
         memcpy(s->ring, src + first, n - first);
     __atomic_store_n(&s->wpos, s->wpos + n, __ATOMIC_RELEASE);
-    return (int64_t)n;
 }
 
 static int64_t dsp_read(fs_file_t *f, int64_t off, void *buf, size_t n)

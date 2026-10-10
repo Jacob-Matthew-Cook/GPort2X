@@ -111,6 +111,9 @@ struct gsys {
     gsys_config_t cfg;
     fs_t *fs;
     gpdev_t *dev;
+    struct dual940 *core940;
+    /* the native engine: a guest mapping of the register file was made */
+    void (*regs_mapped_fn)(gsys_t *s, gaddr_t addr, uint32_t obj_off, uint32_t len); /* the ARM940T (interpreter engine; natively a host thread runs it) */
     gtask_t *tasks;
     int ntasks;
     int next_pid;

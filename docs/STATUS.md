@@ -38,6 +38,7 @@ game state at one frame (a "state diff", see [tests/README.md](../tests/README.m
 | /dev/mmuhack, CPU clock changes | done | boot trace | 3.6, 3.7 |
 | GPIO buttons, battery, TV-out chip, consoles | done for the menu's needs; some values assumed (open questions 7, 8) | `test_menu` | 3.8, 3.9 |
 | MMSP2 registers: timer, GPIO, clock change, display control, latched memory; a flip is a scan-out write | done | `tests/dev`, 301 of 301 frames | 4 |
+| beyond Payback: the 2D blitter, the 8 bpp palette RGB layer and its line stride, the vsync line (GPIOB bit 4), the ARM940T second core | done (note 14) | `tests/dev`, `tests/game/test_ldso.py`, ten other commercial titles by hand | |
 | copy protection: genuine values reported, never bypassed | done; check C4 fails, as it does on a genuine device | `tests/card` (genuine image), boot trace | 6 |
 | firmware boot: rc.sysinit, irqbattery, gp2xmenu, autorun, explorer; the Game section's launch, the exec fallback to `sh`, the launcher stub and its tmpfs | done | `test_menu`, `test_chain` | 7.1-7.3 |
 | the menu renders, navigates and launches; the game to frame 300 identical | done | `test_menu`, `test_boot`, `test_chain` | 7.6 P1-P4 |
@@ -133,6 +134,22 @@ game state at one frame (a "state diff", see [tests/README.md](../tests/README.m
     position, the player's firmware and card image read-only, saves in the
     port's folder; QUIT in the game returns to the handheld's menu (note 3).
     No game or firmware data is packaged ([LEGAL.md](../LEGAL.md)).
+
+14. **Other games.** Ten more commercial GP2X titles run (Wind and Water
+    full and teaser, Blazar, Eggstreme 3, Flurkies, Quartz 2, Bloxz, Odonata,
+    retrovirus RTS, Vektar, Captain Crusader's demo; checked by screenshots
+    under the interpreter and the native engine). For them: the MMSP2 2D
+    blitter at 0xE0020000 (fills, copies, ternary ROPs, a transparent
+    colour; a source from the CPU FIFO is not modelled); the RGB layer in
+    8 bpp through its palette and with its line stride (the native engine
+    traps the palette page's stores to see them); GPIOB bit 4 as the vsync
+    line; the ARM940T (released from reset through DUALCTRL940, run by the
+    interpreter on its 16 MB bank, CP15 recorded, no inter-core
+    interrupts); a blocking OSS write larger than the buffer returning only
+    when all of it is queued; and a position-independent program run
+    directly (ld.so as a command) loaded at ELF_ET_DYN_BASE. A 32-bit store
+    to the palette port is taken as a whole entry, which is inferred from a
+    program, not documented.
 
 ## Deviations from the specification
 

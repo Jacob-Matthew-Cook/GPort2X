@@ -16,10 +16,15 @@
 
 #define REG_CLKCHGSTREG 0x0902
 #define REG_TCOUNT 0x0A00
+#define REG_GPIOB 0x1182 /* bit 4: the LCD's vertical sync */
 #define REG_GPIOC 0x1184
 #define REG_GPIOD 0x1186
 #define REG_GPIOM 0x1198
 #define REG_DPC_CNTL 0x2800
+#define REG_MLC_STL_CNTL 0x28DA  /* RGB layer control: bits 9-10 the depth, 1 = 8 bpp (palette), 2 = 16 bpp */
+#define REG_MLC_STL_HW 0x290C    /* RGB layer line stride in bytes */
+#define REG_MLC_STL_PALLT_A 0x2958 /* palette index */
+#define REG_MLC_STL_PALLT_D 0x295A /* palette data: G << 8 | B, then R; the index then advances */
 #define REG_MLC_STL_EADRL 0x2912
 #define REG_MLC_STL_EADRH 0x2914
 
@@ -98,6 +103,30 @@ bool gpdev_sleeps_are_real(const gpdev_t *d) { return d->cfg.clock_mode == GPDEV
 
 /* ---- register file ----------------------------------------------------- */
 
+/* GPIOB bit 4 follows the LCD's vertical sync, which programs wait on before
+ * drawing. On the real clock it is high in the vertical blank of each 60 Hz
+ * frame (about the last 1/10 of it); on the stepped clocks, which a polling
+ * loop would never advance, it changes at every read. */
+#define VSYNC_FRAME_NS 16683333ull
+#define VSYNC_BLANK_NS 1500000ull
+static bool vsync_level(gpdev_t *d, bool poll)
+{
+    if (d->cfg.clock_mode == GPDEV_CLOCK_REAL) {
+        uint64_t ns = monotonic_ns();
+        return ns % VSYNC_FRAME_NS >= VSYNC_FRAME_NS - VSYNC_BLANK_NS;
+    }
+    if (!poll)
+        d->vsync_toggle = !d->vsync_toggle;
+    return d->vsync_toggle;
+}
+
+static void vsync_store(gpdev_t *d, bool poll)
+{
+    uint8_t *p = d->regfile + REG_GPIOB;
+    uint8_t v = (uint8_t)((*p & ~0x10u) | (vsync_level(d, poll) ? 0x10u : 0));
+    __atomic_store_n(p, v, __ATOMIC_RELAXED);
+}
+
 static uint32_t regs_read(void *ctx, uint32_t off, unsigned size)
 {
     gpdev_t *d = ctx;
@@ -110,6 +139,8 @@ static uint32_t regs_read(void *ctx, uint32_t off, unsigned size)
     }
     if (off + size > GP2X_REGS_SIZE)
         return 0;
+    if (off <= REG_GPIOB && REG_GPIOB < off + size)
+        vsync_store(d, false);
     v = 0;
     for (unsigned i = 0; i < size; i++)
         v |= (uint32_t)d->regfile[off + i] << (8 * i);
@@ -121,12 +152,52 @@ static uint32_t regs_read(void *ctx, uint32_t off, unsigned size)
 
 static void flip_event(gpdev_t *d, gpaddr_t page);
 
+/* The palette port. A 32-bit write at the index register is taken as a whole
+ * 0x00RRGGBB entry at the current index (programs store the colour that way
+ * to the data port, unaligned, which an ARM920T store aligns down to the
+ * index register's word); no documentation of that case. Returns true when
+ * the write is consumed (not stored in the register file). */
+bool gpdev_palette_store(gpdev_t *d, uint32_t off, unsigned size, uint32_t value)
+{
+    /* the scanout pair, latched at its high half's write (the flip rule) for
+     * the native poll, which could otherwise read a half-written pair */
+    if (off <= REG_MLC_STL_EADRH && REG_MLC_STL_EADRH < off + size) {
+        uint16_t lo, hi = (uint16_t)(value >> (8 * (REG_MLC_STL_EADRH - off)));
+        if (off <= REG_MLC_STL_EADRL && size == 4)
+            lo = (uint16_t)value;
+        else
+            memcpy(&lo, d->regfile + REG_MLC_STL_EADRL, 2);
+        __atomic_store_n(&d->native_latched_scanout, ((gpaddr_t)hi << 16) | lo, __ATOMIC_RELEASE);
+    }
+    if (off == REG_MLC_STL_PALLT_A && size == 4) {
+        d->palette[d->pal_index++ & 0xFF] = value & 0xFFFFFF;
+        d->pal_half = false;
+        return true;
+    }
+    if (off == REG_MLC_STL_PALLT_A && size == 2) {
+        d->pal_index = value & 0xFF;
+        d->pal_half = false;
+    } else if (off == REG_MLC_STL_PALLT_D && size == 2) {
+        uint32_t *e = &d->palette[d->pal_index & 0xFF];
+        if (!d->pal_half) {
+            *e = (*e & 0xFF0000) | (value & 0xFFFF);
+        } else {
+            *e = (*e & 0xFFFF) | ((value & 0xFF) << 16);
+            d->pal_index++;
+        }
+        d->pal_half = !d->pal_half;
+    }
+    return false;
+}
+
 static void regs_write(void *ctx, uint32_t off, unsigned size, uint32_t value)
 {
     gpdev_t *d = ctx;
     if (off + size > GP2X_REGS_SIZE)
         return;
     gp_trace(GP_TRACE_MMIO, "regs wr%u %04x <- %0*x", size * 8, off, (int)size * 2, value);
+    if (gpdev_palette_store(d, off, size, value))
+        return;
     for (unsigned i = 0; i < size; i++)
         d->regfile[off + i] = (uint8_t)(value >> (8 * i));
     /* The flip event: the RGB layer's even-field address pair is written low
@@ -146,6 +217,150 @@ static const gmem_mmio_ops_t regs_ops = { regs_read, regs_write };
 
 uint32_t gpdev_reg_read(gpdev_t *d, uint32_t off, unsigned size) { return regs_read(d, off, size); }
 void gpdev_reg_write(gpdev_t *d, uint32_t off, unsigned size, uint32_t v) { regs_write(d, off, size, v); }
+
+
+/* ---- 2D blitter (FastIO, 0xE0020000) --------------------------------------
+ * The registers as the GP2X wiki's "Using the hardware blitter" documents
+ * them (offsets from 0xE0020000):
+ *   0x00 DSTCTRL  bit 6 enable, bit 5 16 bpp (else 8), bits 0-4 the bit
+ *                 offset of the first pixel in its word ("fraction")
+ *   0x04 DSTADDR  physical byte address (word-aligned)   0x08 DSTSTRIDE bytes
+ *   0x0C SRCCTRL  bit 7 enable, bit 5 16 bpp, bit 8 source from memory (not
+ *                 the CPU FIFO), bits 0-4 fraction
+ *   0x10 SRCADDR  0x14 SRCSTRIDE
+ *   0x20 PATCTRL  0x24 FORCOLOR (the pattern colour of a fill)
+ *   0x2C SIZE     height << 16 | width, in pixels
+ *   0x30 CTRL     bits 0-7 the ternary ROP (0xCC copy, 0xF0 fill), bit 9 /
+ *                 bit 10 positive Y / X, bit 11 transparency (bits 16-31 the
+ *                 transparent colour)
+ *   0x34 STATUS   write bit 0 to run; reads bit 0 set while busy
+ * The blit runs at once (STATUS reads idle again), on the upper RAM bank,
+ * the only physical memory the model has. */
+#define BLIT_DSTCTRL 0x00
+#define BLIT_DSTADDR 0x04
+#define BLIT_DSTSTRIDE 0x08
+#define BLIT_SRCCTRL 0x0C
+#define BLIT_SRCADDR 0x10
+#define BLIT_SRCSTRIDE 0x14
+#define BLIT_PATCTRL 0x20
+#define BLIT_FORCOLOR 0x24
+#define BLIT_SIZE 0x2C
+#define BLIT_CTRL 0x30
+#define BLIT_STATUS 0x34
+
+static uint32_t blit_reg(const gpdev_t *d, uint32_t off)
+{
+    uint32_t v;
+    memcpy(&v, d->blitregs + off, 4);
+    return v;
+}
+
+static uint8_t *blit_ptr(gpdev_t *d, uint32_t phys, uint32_t bytes)
+{
+    if (phys < GP2X_UPPER_BANK_PHYS || phys + (uint64_t)bytes > (uint64_t)GP2X_UPPER_BANK_PHYS + GP2X_UPPER_BANK_SIZE)
+        return NULL;
+    return gmem_obj_host(d->upper) + (phys - GP2X_UPPER_BANK_PHYS);
+}
+
+/* The ternary ROP, bit by bit: bit (P<<2 | S<<1 | D) of rop is the result. */
+static uint32_t rop3(uint8_t rop, uint32_t p, uint32_t s, uint32_t dv)
+{
+    uint32_t r = 0;
+    for (int i = 0; i < 8; i++)
+        if (rop & (1u << i)) {
+            uint32_t m = ((i & 4) ? p : ~p) & ((i & 2) ? s : ~s) & ((i & 1) ? dv : ~dv);
+            r |= m;
+        }
+    return r;
+}
+
+static void blit_run(gpdev_t *d)
+{
+    uint32_t dctl = blit_reg(d, BLIT_DSTCTRL), sctl = blit_reg(d, BLIT_SRCCTRL), pctl = blit_reg(d, BLIT_PATCTRL);
+    uint32_t ctrl = blit_reg(d, BLIT_CTRL), size = blit_reg(d, BLIT_SIZE);
+    uint32_t w = size & 0xFFFF, h = size >> 16;
+    uint8_t rop = (uint8_t)ctrl;
+    bool d16 = dctl & (1u << 5), s16 = sctl & (1u << 5);
+    bool src_on = (sctl & (1u << 7)) != 0, src_mem = (sctl & (1u << 8)) != 0;
+    bool uses_s = ((rop >> 2) & 0x33) != (rop & 0x33);
+    d->blits++;
+    bool known = false;
+    for (unsigned i = 0; i < d->blit_nseen; i++)
+        if (d->blit_seen[i][0] == dctl >> 5 && d->blit_seen[i][1] == sctl >> 5 && d->blit_seen[i][2] == pctl &&
+            d->blit_seen[i][3] == (ctrl & 0xFFFF))
+            known = true;
+    if (!known && d->blit_nseen < 32) {
+        uint32_t *e = d->blit_seen[d->blit_nseen++];
+        e[0] = dctl >> 5; e[1] = sctl >> 5; e[2] = pctl; e[3] = ctrl & 0xFFFF;
+        gp_info("blitter: dst %08x ctl %x stride %u, src %08x ctl %x stride %u, pat %x col %x, %ux%u, ctrl %08x",
+                blit_reg(d, BLIT_DSTADDR), dctl, blit_reg(d, BLIT_DSTSTRIDE), blit_reg(d, BLIT_SRCADDR), sctl,
+                blit_reg(d, BLIT_SRCSTRIDE), pctl, blit_reg(d, BLIT_FORCOLOR), w, h, ctrl);
+    }
+    if (!w || !h)
+        return;
+    if (uses_s && src_on && !src_mem) {
+        gp_warn("blitter: a source from the CPU FIFO is not modelled; blit skipped");
+        return;
+    }
+    unsigned dbpp = d16 ? 2 : 1, sbpp = s16 ? 2 : 1;
+    uint32_t dstride = blit_reg(d, BLIT_DSTSTRIDE), sstride = blit_reg(d, BLIT_SRCSTRIDE);
+    uint32_t daddr = blit_reg(d, BLIT_DSTADDR) + ((dctl & 0x1F) >> 3);
+    uint32_t saddr = blit_reg(d, BLIT_SRCADDR) + ((sctl & 0x1F) >> 3);
+    uint8_t *dp = blit_ptr(d, daddr, (h - 1) * dstride + w * dbpp);
+    uint8_t *sp = uses_s ? blit_ptr(d, saddr, (h - 1) * sstride + w * sbpp) : NULL;
+    if (!dp || (uses_s && !sp)) {
+        gp_warn("blitter: dst %08x or src %08x outside the upper RAM bank; blit skipped", daddr, saddr);
+        return;
+    }
+    uint32_t pat = blit_reg(d, BLIT_FORCOLOR), key = ctrl >> 16;
+    bool transparent = (ctrl & (1u << 11)) != 0;
+    bool ypos = (ctrl & (1u << 9)) != 0, xpos = (ctrl & (1u << 10)) != 0;
+    uint32_t mask = d16 ? 0xFFFF : 0xFF;
+    for (uint32_t yy = 0; yy < h; yy++) {
+        uint32_t y = ypos ? yy : h - 1 - yy;
+        for (uint32_t xx = 0; xx < w; xx++) {
+            uint32_t x = xpos ? xx : w - 1 - xx;
+            uint8_t *dq = dp + y * dstride + x * dbpp;
+            uint32_t dv = d16 ? (uint32_t)(dq[0] | dq[1] << 8) : dq[0];
+            uint32_t sv = 0;
+            if (sp) {
+                const uint8_t *sq = sp + y * sstride + x * sbpp;
+                sv = s16 ? (uint32_t)(sq[0] | sq[1] << 8) : sq[0];
+                if (transparent && (sv & mask) == (key & mask))
+                    continue;
+            }
+            uint32_t r = rop3(rop, pat, sv, dv) & mask;
+            dq[0] = (uint8_t)r;
+            if (d16)
+                dq[1] = (uint8_t)(r >> 8);
+        }
+    }
+}
+
+static uint32_t blit_read(void *ctx, uint32_t off, unsigned size)
+{
+    gpdev_t *d = ctx;
+    uint32_t v = 0;
+    if (off + size <= GP2X_BLIT_SIZE)
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint32_t)d->blitregs[off + i] << (8 * i);
+    return v;
+}
+
+static void blit_write(void *ctx, uint32_t off, unsigned size, uint32_t value)
+{
+    gpdev_t *d = ctx;
+    if (off + size > GP2X_BLIT_SIZE)
+        return;
+    for (unsigned i = 0; i < size; i++)
+        d->blitregs[off + i] = (uint8_t)(value >> (8 * i));
+    if (off <= BLIT_STATUS && BLIT_STATUS < off + size && (d->blitregs[BLIT_STATUS] & 1u)) {
+        blit_run(d);
+        d->blitregs[BLIT_STATUS] &= (uint8_t)~1u;
+    }
+}
+
+static const gmem_mmio_ops_t blit_ops = { blit_read, blit_write };
 
 /* ---- pad --------------------------------------------------------------- */
 
@@ -249,11 +464,39 @@ static void pad_script_tick(gpdev_t *d, uint64_t frame)
 
 /* ---- flips and frame dumps --------------------------------------------- */
 
+/* The page as the RGB layer shows it: its depth (MLC_STL_CNTL; 16 bpp until a
+ * program sets it) and line stride (MLC_STL_HW; 640 bytes until set), the
+ * 8 bpp colours through the palette. The top-left 320 x 240 is shown. */
 int gpdev_read_page(gpdev_t *d, gpaddr_t phys, uint16_t *out)
 {
-    if (phys < GP2X_UPPER_BANK_PHYS || phys + GP2X_FB_PAGE_BYTES > GP2X_UPPER_BANK_PHYS + GP2X_UPPER_BANK_SIZE)
+    uint16_t cntl, hw;
+    memcpy(&cntl, d->regfile + REG_MLC_STL_CNTL, 2);
+    memcpy(&hw, d->regfile + REG_MLC_STL_HW, 2);
+    bool pal8 = ((cntl >> 9) & 3) == 1;
+    uint32_t stride = hw ? hw : (pal8 ? 320 : 640);
+    uint32_t bpp = pal8 ? 1 : 2;
+    if (stride < 320 * bpp)
+        stride = 320 * bpp;
+    uint64_t need = (uint64_t)stride * 239 + 320 * bpp;
+    if (phys < GP2X_UPPER_BANK_PHYS || phys + need > (uint64_t)GP2X_UPPER_BANK_PHYS + GP2X_UPPER_BANK_SIZE)
         return -EINVAL;
-    memcpy(out, gmem_obj_host(d->upper) + (phys - GP2X_UPPER_BANK_PHYS), GP2X_FB_PAGE_BYTES);
+    const uint8_t *src = gmem_obj_host(d->upper) + (phys - GP2X_UPPER_BANK_PHYS);
+    if (!pal8 && stride == 640) {
+        memcpy(out, src, GP2X_FB_PAGE_BYTES);
+        return 0;
+    }
+    for (int y = 0; y < 240; y++) {
+        const uint8_t *row = src + (size_t)y * stride;
+        uint16_t *o = out + y * 320;
+        if (!pal8) {
+            memcpy(o, row, 640);
+            continue;
+        }
+        for (int x = 0; x < 320; x++) {
+            uint32_t c = d->palette[row[x]];
+            o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c & 0xFF) >> 3));
+        }
+    }
     return 0;
 }
 
@@ -579,7 +822,9 @@ gpdev_t *gpdev_create(const gpdev_config_t *cfg)
     d->upper = gmem_obj_ram(GP2X_UPPER_BANK_SIZE);
     d->regfile = d->regfile_store;
     d->regs = gmem_obj_mmio(GP2X_REGS_SIZE, &regs_ops, d);
-    if (!d->upper || !d->regs) {
+    d->blitregs = d->blitregs_store;
+    d->blit = gmem_obj_mmio(GP2X_BLIT_SIZE, &blit_ops, d);
+    if (!d->upper || !d->regs || !d->blit) {
         gpdev_destroy(d);
         return NULL;
     }
@@ -612,6 +857,8 @@ void gpdev_destroy(gpdev_t *d)
         gmem_obj_release(d->upper);
     if (d->regs)
         gmem_obj_release(d->regs);
+    if (d->blit)
+        gmem_obj_release(d->blit);
     free(d->script);
     free(d->tscript);
 #if defined(__linux__)
@@ -627,6 +874,13 @@ void gpdev_set_frontend_process(gpdev_t *d, int pid) { d->fe_pid = pid; }
 
 gmem_obj_t *gpdev_upper_bank(gpdev_t *d) { return d->upper; }
 gmem_obj_t *gpdev_regs(gpdev_t *d) { return d->regs; }
+uint16_t gpdev_reg_peek16(const gpdev_t *d, uint32_t off)
+{
+    uint16_t v;
+    memcpy(&v, d->regfile + (off & (GP2X_REGS_SIZE - 2)), 2);
+    return v;
+}
+gmem_obj_t *gpdev_blitter(gpdev_t *d) { return d->blit; }
 
 /* Native engine (docs/NATIVE_ENGINE.md, spec 4.1): the guest reads and writes
  * the register file as plain shared memory, so the device's read and write
@@ -642,6 +896,12 @@ int gpdev_native_regs(gpdev_t *d)
     gmem_obj_release(d->regs);
     d->regs = o;
     d->regfile = gmem_obj_host(o);
+    gmem_obj_t *b = gmem_obj_ram(GP2X_BLIT_SIZE); /* the blitter's page: run bit polled below */
+    if (!b)
+        return -1;
+    gmem_obj_release(d->blit);
+    d->blit = b;
+    d->blitregs = gmem_obj_host(b);
     return 0;
 }
 
@@ -651,12 +911,20 @@ void gpdev_native_poll(gpdev_t *d, bool flips)
     __atomic_store_n((uint32_t *)(void *)(d->regfile + REG_TCOUNT), v, __ATOMIC_RELAXED);
     if (d->regfile[REG_CLKCHGSTREG] & 1u)
         d->regfile[REG_CLKCHGSTREG] &= (uint8_t)~1u; /* PLL change complete */
+    vsync_store(d, true);
+    if (__atomic_load_n(d->blitregs + BLIT_STATUS, __ATOMIC_ACQUIRE) & 1u) { /* a blit was started */
+        blit_run(d);
+        __atomic_and_fetch(d->blitregs + BLIT_STATUS, (uint8_t)~1u, __ATOMIC_RELEASE);
+    }
     if (!flips)
         return;
     uint16_t lo, hi;
     memcpy(&lo, d->regfile + REG_MLC_STL_EADRL, 2);
     memcpy(&hi, d->regfile + REG_MLC_STL_EADRH, 2);
     gpaddr_t page = ((gpaddr_t)hi << 16) | lo;
+    gpaddr_t latched = __atomic_load_n(&d->native_latched_scanout, __ATOMIC_ACQUIRE);
+    if (latched)
+        page = latched;
     if (page != d->native_last_scanout) {
         d->native_last_scanout = page;
         if (page)

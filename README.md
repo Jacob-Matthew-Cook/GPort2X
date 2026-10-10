@@ -22,6 +22,10 @@ protection: a genuine image passes the game's checks on its own
   independent reference frame for frame (apart from moments timed by the
   audio), and the game state stays identical through all six missions and
   the seven replays (`tests/game`).
+- **Other games:** ten other commercial GP2X titles run, among them Vektar,
+  Odonata, Wind and Water and Blazar, with the MMSP2's 2D blitter, its 8 bpp
+  palette display and the ARM940T second core modelled
+  ([docs/STATUS.md](docs/STATUS.md), note 14).
 - **Full speed on a handheld:** on an Anbernic RG353M (RK3566, ROCKNIX), the
   native engine plays the game at the console's own pace, packaged as a
   PortMaster port.

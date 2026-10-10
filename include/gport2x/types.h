@@ -18,6 +18,7 @@ typedef uint32_t gpaddr_t; /* a GP2X physical address, as reached via /dev/mem *
 /* Guest virtual layout: Linux 2.4 on the GP2X (spec 1.4). */
 #define GUEST_LOAD_BASE 0x00008000u /* first PT_LOAD of every guest ELF */
 #define GUEST_MMAP_BASE 0x40000000u /* TASK_UNMAPPED_BASE: mmap grows up from here */
+#define GUEST_ET_DYN_BASE 0x80000000u /* ELF_ET_DYN_BASE (2 * TASK_SIZE / 3): a directly run ET_DYN program */
 #define GUEST_TASK_SIZE 0xC0000000u /* the initial stack sits just below this */
 #define GUEST_STACK_TOP GUEST_TASK_SIZE
 
@@ -26,6 +27,8 @@ typedef uint32_t gpaddr_t; /* a GP2X physical address, as reached via /dev/mem *
 #define GP2X_UPPER_BANK_SIZE 0x02000000u /* 32 MB: framebuffers, video windows, 940 RAM */
 #define GP2X_REGS_PHYS 0xC0000000u
 #define GP2X_REGS_SIZE 0x00010000u /* 64 KB MMSP2 register file */
+#define GP2X_BLIT_PHYS 0xE0020000u /* the MMSP2 2D blitter's registers (FastIO) */
+#define GP2X_BLIT_SIZE 0x00001000u /* one page; the registers are its first 256 bytes */
 
 /* Harness-internal results: 0 on success, negative on failure.
  * (Guest-visible errno values are produced by the sys module.) */
